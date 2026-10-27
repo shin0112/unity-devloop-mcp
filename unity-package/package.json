@@ -1,0 +1,12 @@
+{
+  "name": "com.shin0112.unity-devloop-mcp",
+  "version": "0.1.0",
+  "displayName": "Unity Devloop MCP Bridge",
+  "description": "Editor-only local HTTP bridge (127.0.0.1) used by the unity-devloop-mcp MCP server to read editor state and console, execute menu items, and refresh assets.",
+  "unity": "2021.3",
+  "author": {
+    "name": "shin0112",
+    "url": "https://github.com/shin0112"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,28 @@
+{
+  "name": "unity-devloop-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for the Unity edit-compile-check loop: read editor state and console/compiler errors, refresh assets, and execute menu items through a local editor bridge.",
+  "type": "module",
+  "bin": {
+    "unity-devloop-mcp": "server/index.js"
+  },
+  "files": [
+    "server"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.23.8"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shin0112/unity-devloop-mcp.git"
+  },
+  "author": "shin0112",
+  "license": "MIT"
+}

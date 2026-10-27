@@ -1,0 +1,16 @@
+{
+    "name": "Shin0112.UnityDevloopMcp.Editor",
+    "rootNamespace": "Shin0112.UnityDevloopMcp.Editor",
+    "references": [],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": false,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
