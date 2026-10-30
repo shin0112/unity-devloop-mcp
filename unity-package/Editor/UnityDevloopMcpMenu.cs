@@ -10,8 +10,10 @@ namespace Shin0112.UnityDevloopMcp.Editor
         [MenuItem(MenuRoot + "Status")]
         private static void ShowStatus()
         {
-            string state = UnityDevloopMcpBridge.IsRunning ? "running" : "stopped";
-            Debug.Log($"[UnityDevloopMcp] Bridge {state} on http://127.0.0.1:{UnityDevloopMcpBridge.Port}/");
+            if (UnityDevloopMcpBridge.IsRunning)
+                Debug.Log($"[UnityDevloopMcp] Bridge running on http://127.0.0.1:{UnityDevloopMcpBridge.ActivePort}/ (base port {UnityDevloopMcpBridge.Port})");
+            else
+                Debug.Log($"[UnityDevloopMcp] Bridge stopped (base port {UnityDevloopMcpBridge.Port})");
         }
 
         [MenuItem(MenuRoot + "Enable Bridge")]

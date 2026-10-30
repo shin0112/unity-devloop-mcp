@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using UnityEditor;
@@ -21,6 +22,8 @@ namespace Shin0112.UnityDevloopMcp.Editor
         private const int MaxLogEntries = 500;
         private const int MaxStackTraceLength = 2000;
         private const int RequestTimeoutMs = 30000;
+        private const int PortSearchCount = 10;
+        private const int MaxHeaderLength = 16384;
 
         private sealed class PendingRequest
         {
@@ -56,14 +59,19 @@ namespace Shin0112.UnityDevloopMcp.Editor
         private static readonly Queue<LogEntry> Logs = new Queue<LogEntry>();
         private static readonly object LogLock = new object();
 
-        private static HttpListener _listener;
+        private static TcpListener _listener;
         private static Thread _listenerThread;
+        private static volatile bool _running;
+        private static string _projectPath;
 
-        public static bool IsRunning => _listener != null && _listener.IsListening;
+        public static bool IsRunning => _listener != null && _running;
         public static int Port => EditorPrefs.GetInt(PortPrefKey, DefaultPort);
+        public static int ActivePort { get; private set; }
 
         static UnityDevloopMcpBridge()
         {
+            _projectPath = Directory.GetParent(Application.dataPath).FullName;
+
             Application.logMessageReceivedThreaded += HandleLog;
             CompilationPipeline.assemblyCompilationFinished += HandleCompilationFinished;
             EditorApplication.update += ProcessPending;
@@ -80,32 +88,48 @@ namespace Shin0112.UnityDevloopMcp.Editor
         {
             if (IsRunning) return;
 
-            try
+            int basePort = Port;
+            for (int offset = 0; offset < PortSearchCount; offset++)
             {
-                _listener = new HttpListener();
-                _listener.Prefixes.Add($"http://127.0.0.1:{Port}/");
-                _listener.Start();
+                int port = basePort + offset;
+                TcpListener listener = new TcpListener(IPAddress.Loopback, port) { ExclusiveAddressUse = true };
+                try
+                {
+                    listener.Start();
+                }
+                catch (SocketException)
+                {
+                    continue;
+                }
+
+                _listener = listener;
+                ActivePort = port;
+                break;
             }
-            catch (System.Exception exception)
+
+            if (_listener == null)
             {
-                _listener = null;
-                Debug.LogWarning($"[UnityDevloopMcp] Failed to start on port {Port}: {exception.Message}");
+                Debug.LogWarning($"[UnityDevloopMcp] Failed to start: ports {basePort}-{basePort + PortSearchCount - 1} are all in use.");
                 return;
             }
 
-            HttpListener listener = _listener;
-            _listenerThread = new Thread(() => ListenLoop(listener)) { IsBackground = true, Name = "UnityDevloopMcpBridge" };
+            if (ActivePort != basePort)
+                Debug.LogWarning($"[UnityDevloopMcp] Port {basePort} is in use, listening on {ActivePort} instead. The MCP server finds it automatically.");
+
+            _running = true;
+            TcpListener activeListener = _listener;
+            _listenerThread = new Thread(() => ListenLoop(activeListener)) { IsBackground = true, Name = "UnityDevloopMcpBridge" };
             _listenerThread.Start();
         }
 
         public static void Stop()
         {
+            _running = false;
             if (_listener == null) return;
 
             try
             {
                 _listener.Stop();
-                _listener.Close();
             }
             catch (System.Exception)
             {
@@ -113,62 +137,149 @@ namespace Shin0112.UnityDevloopMcp.Editor
 
             _listener = null;
             _listenerThread = null;
+            ActivePort = 0;
         }
 
         // -----------------------------------------------------
         // Listener thread
         // -----------------------------------------------------
-        private static void ListenLoop(HttpListener listener)
+        private static void ListenLoop(TcpListener listener)
         {
-            while (listener.IsListening)
+            while (_running)
             {
-                HttpListenerContext context;
+                TcpClient client;
                 try
                 {
-                    context = listener.GetContext();
+                    client = listener.AcceptTcpClient();
                 }
                 catch (System.Exception)
                 {
                     return;
                 }
 
-                ThreadPool.QueueUserWorkItem(_ => HandleContext(context));
+                ThreadPool.QueueUserWorkItem(_ => HandleClient(client));
             }
         }
 
-        private static void HandleContext(HttpListenerContext context)
+        private static void HandleClient(TcpClient client)
         {
-            string response;
-            try
+            using (client)
             {
+                NetworkStream stream;
+                string route;
                 string body;
-                using (StreamReader reader = new StreamReader(context.Request.InputStream, Encoding.UTF8))
+                try
                 {
-                    body = reader.ReadToEnd();
+                    stream = client.GetStream();
+                    if (!TryReadRequest(stream, out route, out body)) return;
+                }
+                catch (System.Exception)
+                {
+                    return;
                 }
 
-                PendingRequest request = new PendingRequest { Route = context.Request.Url.AbsolutePath, Body = body };
-                Pending.Enqueue(request);
-                response = request.Done.Wait(RequestTimeoutMs)
-                    ? request.Response
-                    : Error("Timed out waiting for the editor main thread (editor busy or unfocused with throttled updates).");
+                string response;
+                try
+                {
+                    response = route == "/ping" ? BuildPing() : DispatchOnMainThread(route, body);
+                }
+                catch (System.Exception exception)
+                {
+                    response = Error(exception.Message);
+                }
+
+                try
+                {
+                    WriteResponse(stream, response);
+                }
+                catch (System.Exception)
+                {
+                }
             }
-            catch (System.Exception exception)
+        }
+
+        private static string DispatchOnMainThread(string route, string body)
+        {
+            PendingRequest request = new PendingRequest { Route = route, Body = body };
+            Pending.Enqueue(request);
+            return request.Done.Wait(RequestTimeoutMs)
+                ? request.Response
+                : Error("Timed out waiting for the editor main thread (editor busy or unfocused with throttled updates).");
+        }
+
+        private static bool TryReadRequest(NetworkStream stream, out string route, out string body)
+        {
+            route = null;
+            body = string.Empty;
+
+            List<byte> header = new List<byte>(512);
+            int matched = 0;
+            while (matched < 4)
             {
-                response = Error(exception.Message);
+                int value = stream.ReadByte();
+                if (value < 0 || header.Count >= MaxHeaderLength) return false;
+
+                header.Add((byte)value);
+                bool expectCr = matched % 2 == 0;
+                if (expectCr ? value == '\r' : value == '\n') matched++;
+                else matched = value == '\r' ? 1 : 0;
             }
 
-            try
+            string[] lines = Encoding.ASCII.GetString(header.ToArray()).Split(new[] { "\r\n" }, System.StringSplitOptions.None);
+            string[] requestLine = lines[0].Split(' ');
+            if (requestLine.Length < 2) return false;
+
+            route = requestLine[1];
+            int queryIndex = route.IndexOf('?');
+            if (queryIndex >= 0) route = route.Substring(0, queryIndex);
+
+            int contentLength = 0;
+            for (int i = 1; i < lines.Length; i++)
             {
-                byte[] bytes = Encoding.UTF8.GetBytes(response);
-                context.Response.ContentType = "application/json; charset=utf-8";
-                context.Response.ContentLength64 = bytes.Length;
-                context.Response.OutputStream.Write(bytes, 0, bytes.Length);
-                context.Response.OutputStream.Close();
+                int separator = lines[i].IndexOf(':');
+                if (separator <= 0) continue;
+                if (!lines[i].Substring(0, separator).Trim().Equals("Content-Length", System.StringComparison.OrdinalIgnoreCase)) continue;
+
+                int.TryParse(lines[i].Substring(separator + 1).Trim(), out contentLength);
             }
-            catch (System.Exception)
+
+            if (contentLength <= 0) return true;
+
+            byte[] buffer = new byte[contentLength];
+            int read = 0;
+            while (read < contentLength)
             {
+                int count = stream.Read(buffer, read, contentLength - read);
+                if (count <= 0) return false;
+                read += count;
             }
+
+            body = Encoding.UTF8.GetString(buffer);
+            return true;
+        }
+
+        private static void WriteResponse(NetworkStream stream, string response)
+        {
+            byte[] content = Encoding.UTF8.GetBytes(response);
+            byte[] header = Encoding.ASCII.GetBytes(
+                "HTTP/1.1 200 OK\r\n" +
+                "Content-Type: application/json; charset=utf-8\r\n" +
+                $"Content-Length: {content.Length}\r\n" +
+                "Connection: close\r\n\r\n");
+
+            stream.Write(header, 0, header.Length);
+            stream.Write(content, 0, content.Length);
+            stream.Flush();
+        }
+
+        private static string BuildPing()
+        {
+            StringBuilder json = new StringBuilder("{\"ok\":true");
+            AppendField(json, "projectPath", _projectPath);
+            json.Append(",\"port\":").Append(ActivePort);
+            json.Append(",\"pid\":").Append(System.Diagnostics.Process.GetCurrentProcess().Id);
+            json.Append('}');
+            return json.ToString();
         }
 
         // -----------------------------------------------------
@@ -217,7 +328,8 @@ namespace Shin0112.UnityDevloopMcp.Editor
         private static string BuildStatus()
         {
             StringBuilder json = new StringBuilder("{\"ok\":true");
-            AppendField(json, "projectPath", Directory.GetParent(Application.dataPath).FullName);
+            AppendField(json, "projectPath", _projectPath);
+            json.Append(",\"port\":").Append(ActivePort);
             AppendField(json, "unityVersion", Application.unityVersion);
             AppendField(json, "activeScene", EditorSceneManager.GetActiveScene().path);
             AppendField(json, "buildTarget", EditorUserBuildSettings.activeBuildTarget.ToString());
